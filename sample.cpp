@@ -4,7 +4,7 @@
 #include <random>
 #include <chrono>
 #include <omp.h>
-
+#include <fstream>
 using namespace Eigen;
 using namespace std;
 
@@ -27,10 +27,16 @@ pair<MatrixXd, MatrixXd> policyGradientEstimationNaive(
     const MatrixXd &A, const MatrixXd &B, const MatrixXd &Q, const MatrixXd &R,
     std::mt19937 &gen, std::normal_distribution<> &dist
 ) {
-    vector<pair<double, MatrixXd>> C_estimates;
-    vector<MatrixXd> sigma_estimates;
+    vector<pair<double, MatrixXd>> C_estimates(m);
+    vector<MatrixXd> sigma_estimates(m);
 
+    // Pre-allocate vectors to avoid race conditions
+    #pragma omp parallel for
     for (int i = 0; i < m; ++i) {
+        // Create thread-local random number generator to avoid race conditions
+        std::mt19937 thread_gen(gen());
+        std::normal_distribution<> thread_dist = dist;
+
         // Sample random matrix U_i with Frobenius norm r
         MatrixXd U_i = MatrixXd::Random(K.rows(), K.cols());
         U_i *= r / frobeniusNorm(U_i);
@@ -42,8 +48,8 @@ pair<MatrixXd, MatrixXd> policyGradientEstimationNaive(
         double totalCost = 0.0;
         vector<VectorXd> states(rollOutLength, VectorXd(d));
         
-        // Sample initial state
-        VectorXd x = sampleInitialState(d, gen, dist);
+        // Sample initial state from uniform distribution with [-2sqrt(3), 2sqrt(3)]
+        VectorXd x = VectorXd::Random(d) * 2 * sqrt(3);
 
         for (int t = 0; t < rollOutLength; ++t) {
             states[t] = x;
@@ -59,8 +65,9 @@ pair<MatrixXd, MatrixXd> policyGradientEstimationNaive(
             Sigma_i += s * s.transpose();
         }
 
-        C_estimates.emplace_back(C_i, U_i);
-        sigma_estimates.push_back(Sigma_i);
+        // Store results in pre-allocated vectors
+        C_estimates[i] = {C_i, U_i};
+        sigma_estimates[i] = Sigma_i;
     }
 
     // Calculate final estimates
@@ -78,68 +85,10 @@ pair<MatrixXd, MatrixXd> policyGradientEstimationNaive(
     return {gradientEstimate, sigmaEstimate};
 }
 
-pair<MatrixXd, MatrixXd> policyGradientEstimationOptimized(
-    const MatrixXd &K, int m, int rollOutLength, double r, int d,
-    const MatrixXd &A, const MatrixXd &B, const MatrixXd &Q, const MatrixXd &R,
-    std::mt19937 &gen, std::normal_distribution<> &dist
-) {
-    MatrixXd gradientEstimate = MatrixXd::Zero(K.rows(), K.cols());
-    MatrixXd sigmaEstimate = MatrixXd::Zero(d, d);
-
-    // Create thread-local matrices for accumulation
-    #pragma omp parallel
-    {
-        MatrixXd localGradient = MatrixXd::Zero(K.rows(), K.cols());
-        MatrixXd localSigma = MatrixXd::Zero(d, d);
-        
-
-        #pragma omp for nowait
-        for (int i = 0; i < m; ++i) {
-            MatrixXd U_i = MatrixXd::Random(K.rows(), K.cols()) * r;
-
-            // Create thread-local random number generator
-            std::mt19937 local_gen(gen());
-            std::normal_distribution<> local_dist = dist;
-            VectorXd x = sampleInitialState(d, local_gen, local_dist);
-
-            MatrixXd K_i = K + U_i;
-            MatrixXd closedLoopDynamics = A - B * K_i;
-            MatrixXd costMatrix = Q + K.transpose() * R * K;
-
-            vector<VectorXd> states(rollOutLength, VectorXd(d));
-            states[0] = x;
-
-            double C_i = 0.0;
-            for (int t = 1; t < rollOutLength; ++t) {
-                C_i += states[t - 1].transpose() * costMatrix * states[t - 1];
-                states[t] = closedLoopDynamics * states[t - 1];
-            }
-
-            MatrixXd Sigma_i = MatrixXd::Zero(d, d);
-            for (const auto &s : states) {
-                Sigma_i += s * s.transpose();
-            }
-
-            localGradient += C_i * U_i;
-            localSigma += Sigma_i;
-        }
-
-        // Critical section for accumulating results
-        #pragma omp critical
-        {
-            gradientEstimate += localGradient;
-            sigmaEstimate += localSigma;
-        }
-    }
-    gradientEstimate *= (d / (m * r * r ));
-    sigmaEstimate /= m;
-
-    return {gradientEstimate, sigmaEstimate};
-}
 
 MatrixXd modelFreeNaturalPolicyGradient(
     const MatrixXd &A, const MatrixXd &B, const MatrixXd &Q, const MatrixXd &R,
-    MatrixXd K0, int m, int rollOutLength, double r,
+    MatrixXd K0, int m, int rollOutLength, double r, MatrixXd K_opt,
     int maxIterations = 1000, double eta = 0.01
 ) {
     MatrixXd K = K0;
@@ -148,80 +97,142 @@ MatrixXd modelFreeNaturalPolicyGradient(
     std::mt19937 gen(42);  // Fixed seed for reproducibility
     std::normal_distribution<> dist(0.0, 1.0);
 
+    vector<double> distances;
+
     for (int i = 0; i < maxIterations; ++i) {
         // Get empirical estimates
         auto [gradEstimate, sigmaEstimate] = policyGradientEstimationNaive(
             K, m, rollOutLength, r, d, A, B, Q, R, gen, dist
         );
         
-        std::cout << "Gradient estimate:\n" << gradEstimate << "\n---\n";
+        std::cout << i << ". Gradient estimate:\n" << gradEstimate << "\n---\n";
         
         // Natural policy gradient update
-        MatrixXd K_new = K - eta * gradEstimate;
+        MatrixXd K_new = K - eta * gradEstimate * sigmaEstimate.inverse();
+
+        auto distance = (K - K_opt).norm();
+        distances.push_back(distance);
         
-        // // Check convergence
-        // if ((K - K_new).norm() < 1e-8) {
-        //     break;
-        // }
+        // Check convergence
+        if (distance < 1e-5) {
+            break;
+        }
         
         K = K_new;
         std::cout << "Current K:\n" << K << std::endl;
     }
+
+    // Save distances to file
+    std::cout << "Saving distances to file..." << std::endl;
+    std::ofstream file("distances_npg.txt");
+    for (double d : distances) {
+        file << d << "\n";
+    }
+    file.close();
+    return K;
+}
+
+
+MatrixXd modelFreePolicyGradient(
+    const MatrixXd &A, const MatrixXd &B, const MatrixXd &Q, const MatrixXd &R,
+    MatrixXd K0, int m, int rollOutLength, double r, MatrixXd K_opt,
+    int maxIterations = 1000, double eta = 0.01
+) {
+    MatrixXd K = K0;
+    int d = A.rows();
     
+    std::mt19937 gen(42);  // Fixed seed for reproducibility
+    std::normal_distribution<> dist(0.0, 1.0);
+
+    vector<double> distances;
+
+    for (int i = 0; i < maxIterations; ++i) {
+        // Get empirical estimates
+        auto [gradEstimate, sigmaEstimate] = policyGradientEstimationNaive(
+            K, m, rollOutLength, r, d, A, B, Q, R, gen, dist
+        );
+        
+        std::cout << i << ". Gradient estimate:\n" << gradEstimate << "\n---\n";
+        
+        // Natural policy gradient update
+        MatrixXd K_new = K - eta * gradEstimate;
+
+        auto distance = (K - K_opt).norm();
+        distances.push_back(distance);
+        
+        // Check convergence
+        if (distance < 1e-5) {
+            break;
+        }
+        
+        K = K_new;
+        std::cout << "Current K:\n" << K << std::endl;
+    }
+
+    // Save distances to file
+    std::cout << "Saving distances to file..." << std::endl;
+    std::ofstream file("distances_pg.txt");
+    for (double d : distances) {
+        file << d << "\n";
+    }
+    file.close();
     return K;
 }
 
 int main() {
     int d = 2;
-    int m = 300000;
-    int rollOutLength = 150;
-    double r = 0.001;
+    int m = 900;
+    int rollOutLength = 200;
+    double r = 0.7;
+    int maxIterations = 3000;
+    double eta = 0.009;
 
     double dt = 0.1;
     MatrixXd K(1, d); K << 1, 1;
     MatrixXd A = (MatrixXd(d, d) << 1, dt, 0, 1).finished();
     MatrixXd B = (MatrixXd(d, 1) << 0.5 * dt * dt, dt).finished();
     MatrixXd Q = MatrixXd::Identity(d, d) * 2;
-    MatrixXd R = MatrixXd::Identity(1, 1);
+    MatrixXd R = MatrixXd::Identity(1, 1) * 0.01;
 
-    // std::mt19937 gen(0);
-    // std::normal_distribution<> dist(0.0, 1.0);
-
-    // auto start = std::chrono::high_resolution_clock::now();
-    // // auto [gradientNaive, sigmaNaive] = policyGradientEstimationNaive(K, m, rollOutLength, r, d, A, B, Q, R, gen, dist);
-    // auto end = std::chrono::high_resolution_clock::now();
-    // std::cout << "Naive Time Taken: " << std::chrono::duration<double>(end - start).count() << " seconds\n";
-
-    // std::mt19937 gen2(42);
-    // start = std::chrono::high_resolution_clock::now();
-    // auto [gradientOptimized, sigmaOptimized] = policyGradientEstimationOptimized(K, m, rollOutLength, r, d, A, B, Q, R, gen2, dist);
-    // end = std::chrono::high_resolution_clock::now();
-    // std::cout << "Optimized Time Taken: " << std::chrono::duration<double>(end - start).count() << " seconds\n";
-
-    // // std::cout << gradientNaive << std::endl << std::endl << std::endl;
-    // std::cout << gradientOptimized << std::endl << std::endl << std::endl;
-
-    // // assert((gradientNaive - gradientOptimized).norm() < 1e-6);
-
-    // // Test model-free natural policy gradient
+    // Test model-free natural policy gradient
     MatrixXd K0(1, d);
     K0 << 1.0, 1.0;  // Initial K matrix
     
     std::cout << "Starting model-free natural policy gradient optimization...\n";
     auto start = std::chrono::high_resolution_clock::now();
+
+    MatrixXd K_opt(1, d);
+    K_opt << 6.977, 7.914;
     
     MatrixXd Kest = modelFreeNaturalPolicyGradient(
         A, B, Q, R, K0, 
-        3000,    // m
-        200,     // rollOutLength
-        0.1,    // r
-        10000,     // maxIterations
-        0.0005    // eta
+        m,    // m
+        rollOutLength,     // rollOutLength
+        r,    // r
+        K_opt,  // K_opt
+        maxIterations,     // maxIterations
+        eta    // eta
     );
     
     auto end = std::chrono::high_resolution_clock::now();
     std::cout << "Optimization Time: " << std::chrono::duration<double>(end - start).count() << " seconds\n";
     std::cout << "Final K:\n" << Kest << std::endl;
+
+    start = std::chrono::high_resolution_clock::now();
+    MatrixXd Kest2 = modelFreePolicyGradient(
+        A, B, Q, R, K0, 
+        m,    // m
+        rollOutLength,     // rollOutLength
+        r,    // r
+        K_opt,  // K_opt
+        maxIterations,     // maxIterations
+        eta    // eta
+    );
+    end = std::chrono::high_resolution_clock::now();
+
+    std::cout << "Final K:\n" << Kest2 << std::endl;
+    std::cout << "Distance:\n" << (Kest2 - K_opt).norm() << std::endl;
+    std::cout << "Time:\n" << std::chrono::duration<double>(end - start).count() << " seconds\n";
 
     return 0;
 }
